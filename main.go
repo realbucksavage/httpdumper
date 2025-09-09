@@ -1,300 +1,116 @@
 package main
 
 import (
-	"bufio"
-	"bytes"
+	"context"
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"log"
-	"net"
 	"net/http"
 	"os"
-	"sort"
-	"strings"
+	"os/signal"
+	"syscall"
 	"time"
 )
 
 var (
-	port int
-	echo bool
+	port           int
+	uiPort         int
+	echo           bool
+	historySize    int
+	shutdownTOFlag time.Duration
 )
 
 func init() {
-	flag.IntVar(&port, "port", 8080, "Port to listen on")
+	flag.IntVar(&port, "port", 8080, "Port to listen on for request handling")
+	flag.IntVar(&uiPort, "ui-port", 0, "Port to serve the UI (/ui, /requests.json). If 0, UI is served on the main port for backward compatibility")
 	flag.BoolVar(&echo, "echo", false, "Echo the request back to the caller")
+	flag.IntVar(&historySize, "history", 1000, "Number of recent requests to keep in memory for the UI")
+	flag.DurationVar(&shutdownTOFlag, "shutdown-timeout", 10*time.Second, "Graceful shutdown timeout (e.g., 10s, 1m)")
 }
 
 func main() {
 	flag.Parse()
+	if historySize <= 0 {
+		historySize = 1000
+	}
 
+	// Main server (request handling)
 	addr := fmt.Sprintf(":%d", port)
-	server := &http.Server{
+	mainMux := http.NewServeMux()
+	mainMux.HandleFunc("/", handle)
+
+	mainServer := &http.Server{
 		Addr:              addr,
-		Handler:           http.HandlerFunc(handle),
+		Handler:           mainMux,
 		ReadHeaderTimeout: 15 * time.Second,
 	}
 
-	log.Printf("httpdumper starting on %s (echo=%v)\n", addr, echo)
-	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		log.Fatalf("server error: %v", err)
-	}
-}
+	log.Printf("httpdumper main server starting on %s (echo=%v, history=%d)\n", addr, echo, historySize)
 
-func handle(w http.ResponseWriter, r *http.Request) {
-	// Capture request information and body for possible echo
-	var dump bytes.Buffer
- body, truncated, _ := captureAndDump(&dump, r)
+	// Channel to receive server errors
+	errCh := make(chan error, 2)
 
-	// Print to stdout
-	os.Stdout.Write(dump.Bytes())
+	// Optional UI server pointer for shutdown
+	var uiServer *http.Server
 
-	if echo {
-		// Echo back request headers (excluding hop-by-hop) and body
-		copyEchoHeaders(w.Header(), r.Header)
-		// If client provided Content-Type, preserve it; otherwise keep default
-		if ct := r.Header.Get("Content-Type"); ct != "" {
-			w.Header().Set("Content-Type", ct)
-		} else if w.Header().Get("Content-Type") == "" {
-			w.Header().Set("Content-Type", "application/octet-stream")
+	// If uiPort > 0, start a separate UI server
+	if uiPort > 0 {
+		uiAddr := fmt.Sprintf(":%d", uiPort)
+		uimux := http.NewServeMux()
+		uimux.HandleFunc("/", uiHandler)
+		uimux.HandleFunc("/requests.json", jsonHandler)
+		uiServer = &http.Server{
+			Addr:              uiAddr,
+			Handler:           uimux,
+			ReadHeaderTimeout: 15 * time.Second,
 		}
-		// If body was truncated due to server cap, reflect that exact bytes; optionally indicate via header
-		if truncated {
-			w.Header().Set("X-Echo-Note", "body truncated by server cap")
-		}
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(body)
-		return
-	}
-
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	_, _ = fmt.Fprintf(w, "OK\n")
-}
-
-// dumpRequest is kept for compatibility but unused in echo path.
-// copyEchoHeaders copies request headers to response headers excluding hop-by-hop headers.
-func copyEchoHeaders(dst http.Header, src http.Header) {
-	if src == nil || dst == nil { return }
-	hop := map[string]struct{}{
-		"Connection": {},
-		"Keep-Alive": {},
-		"Proxy-Connection": {},
-		"Transfer-Encoding": {},
-		"Upgrade": {},
-		"TE": {},
-		"Trailer": {},
-		"Content-Length": {},
-		"Host": {},
-	}
-	for k, vals := range src {
-		if _, skip := hop[k]; skip { continue }
-		for _, v := range vals { dst.Add(k, v) }
-	}
-}
-
-func dumpRequest(w io.Writer, r *http.Request) {
-	bw := bufio.NewWriter(w)
-	defer bw.Flush()
-
-	// Start line
-	fmt.Fprintf(bw, "----- REQUEST DUMP (%s) -----\n", time.Now().Format(time.RFC3339Nano))
-	fmt.Fprintf(bw, "%s %s %s\n", r.Method, r.URL.RequestURI(), r.Proto)
-
-	// Remote info
-	fmt.Fprintf(bw, "RemoteAddr: %s\n", r.RemoteAddr)
-	if ip, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-		fmt.Fprintf(bw, "RemoteIP: %s\n", ip)
-	}
-	fmt.Fprintf(bw, "Host: %s\n", r.Host)
-
-	// URL parts
-	fmt.Fprintf(bw, "Scheme: %s\n", schemeOf(r))
-	fmt.Fprintf(bw, "Path: %s\n", r.URL.Path)
-	fmt.Fprintf(bw, "RawQuery: %s\n", r.URL.RawQuery)
-
-	// Headers sorted for stability
-	fmt.Fprintln(bw, "Headers:")
-	keys := make([]string, 0, len(r.Header))
-	for k := range r.Header {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	for _, k := range keys {
-		fmt.Fprintf(bw, "  %s: %s\n", k, strings.Join(r.Header[k], ", "))
-	}
-
-	// Cookies
-	if cs := r.Cookies(); len(cs) > 0 {
-		fmt.Fprintln(bw, "Cookies:")
-		for _, c := range cs {
-			fmt.Fprintf(bw, "  %s=%s; Path=%s; Domain=%s; HttpOnly=%v; Secure=%v\n", c.Name, c.Value, c.Path, c.Domain, c.HttpOnly, c.Secure)
-		}
-	}
-
-	// Body (cap to 10MB)
-	const maxBody = 10 << 20
-	body, bodyErr := readAllWithCap(r.Body, maxBody)
-	defer r.Body.Close()
-	if bodyErr != nil {
-		fmt.Fprintf(bw, "BodyError: %v\n", bodyErr)
-	}
-	fmt.Fprintf(bw, "BodyBytes: %d\n", len(body))
-	if len(body) > 0 {
-		fmt.Fprintln(bw, "Body:")
-		bw.Write(body)
-		if len(body) == maxBody {
-			fmt.Fprintln(bw, "\n-- body truncated --")
-		} else {
-			fmt.Fprintln(bw)
-		}
-	}
-
-	// Trailers (after body read)
-	if len(r.Trailer) > 0 {
-		fmt.Fprintln(bw, "Trailers:")
-		tkeys := make([]string, 0, len(r.Trailer))
-		for k := range r.Trailer {
-			tkeys = append(tkeys, k)
-		}
-		sort.Strings(tkeys)
-		for _, k := range tkeys {
-			fmt.Fprintf(bw, "  %s: %s\n", k, strings.Join(r.Trailer[k], ", "))
-		}
-	}
-
-	// TLS info
-	if r.TLS != nil {
-		fmt.Fprintln(bw, "TLS:")
-		fmt.Fprintf(bw, "  Version: %x\n", r.TLS.Version)
-		fmt.Fprintf(bw, "  CipherSuite: %x\n", r.TLS.CipherSuite)
-		fmt.Fprintf(bw, "  ServerName: %s\n", r.TLS.ServerName)
-	}
-
-	fmt.Fprintln(bw, "-------------------------------")
-}
-
-// captureAndDump writes a diagnostic dump to w, consumes the request body once,
-// and returns the consumed body, whether it was truncated by cap, and any error encountered.
-func captureAndDump(w io.Writer, r *http.Request) ([]byte, bool, error) {
-	const maxBody = 10 << 20
-	bw := bufio.NewWriter(w)
-	defer bw.Flush()
-
-	// Start line
-	fmt.Fprintf(bw, "----- REQUEST DUMP (%s) -----\n", time.Now().Format(time.RFC3339Nano))
-	fmt.Fprintf(bw, "%s %s %s\n", r.Method, r.URL.RequestURI(), r.Proto)
-
-	// Remote info
-	fmt.Fprintf(bw, "RemoteAddr: %s\n", r.RemoteAddr)
-	if ip, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-		fmt.Fprintf(bw, "RemoteIP: %s\n", ip)
-	}
-	fmt.Fprintf(bw, "Host: %s\n", r.Host)
-
-	// URL parts
-	fmt.Fprintf(bw, "Scheme: %s\n", schemeOf(r))
-	fmt.Fprintf(bw, "Path: %s\n", r.URL.Path)
-	fmt.Fprintf(bw, "RawQuery: %s\n", r.URL.RawQuery)
-
-	// Headers sorted for stability
-	fmt.Fprintln(bw, "Headers:")
-	keys := make([]string, 0, len(r.Header))
-	for k := range r.Header {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	for _, k := range keys {
-		fmt.Fprintf(bw, "  %s: %s\n", k, strings.Join(r.Header[k], ", "))
-	}
-
-	// Cookies
-	if cs := r.Cookies(); len(cs) > 0 {
-		fmt.Fprintln(bw, "Cookies:")
-		for _, c := range cs {
-			fmt.Fprintf(bw, "  %s=%s; Path=%s; Domain=%s; HttpOnly=%v; Secure=%v\n", c.Name, c.Value, c.Path, c.Domain, c.HttpOnly, c.Secure)
-		}
-	}
-
-	// Body (cap to 10MB)
-	body, bodyErr := readAllWithCap(r.Body, maxBody)
-	defer r.Body.Close()
-	if bodyErr != nil {
-		fmt.Fprintf(bw, "BodyError: %v\n", bodyErr)
-	}
-	fmt.Fprintf(bw, "BodyBytes: %d\n", len(body))
-	if len(body) > 0 {
-		fmt.Fprintln(bw, "Body:")
-		bw.Write(body)
-		if len(body) == maxBody {
-			fmt.Fprintln(bw, "\n-- body truncated --")
-		} else {
-			fmt.Fprintln(bw)
-		}
-	}
-
-	// Trailers (after body read)
-	if len(r.Trailer) > 0 {
-		fmt.Fprintln(bw, "Trailers:")
-		tkeys := make([]string, 0, len(r.Trailer))
-		for k := range r.Trailer {
-			tkeys = append(tkeys, k)
-		}
-		sort.Strings(tkeys)
-		for _, k := range tkeys {
-			fmt.Fprintf(bw, "  %s: %s\n", k, strings.Join(r.Trailer[k], ", "))
-		}
-	}
-
-	// TLS info
-	if r.TLS != nil {
-		fmt.Fprintln(bw, "TLS:")
-		fmt.Fprintf(bw, "  Version: %x\n", r.TLS.Version)
-		fmt.Fprintf(bw, "  CipherSuite: %x\n", r.TLS.CipherSuite)
-		fmt.Fprintf(bw, "  ServerName: %s\n", r.TLS.ServerName)
-	}
-
- fmt.Fprintln(bw, "-------------------------------")
- return body, len(body) == maxBody, bodyErr
- }
-
- func readAllWithCap(rc io.ReadCloser, capBytes int) ([]byte, error) {
-	if rc == nil {
-		return nil, nil
-	}
-	var buf bytes.Buffer
-	buf.Grow(intMin(capBytes, 4096))
-	limReader := io.LimitedReader{R: rc, N: int64(capBytes)}
-	_, err := buf.ReadFrom(&limReader)
-	if err != nil {
-		return buf.Bytes(), err
-	}
-	if limReader.N == 0 { // exactly hit cap, may have more data
-		return buf.Bytes(), nil
-	}
-	return buf.Bytes(), nil
-}
-
-func intMin(a, b int) int { if a < b { return a }; return b }
-
-func schemeOf(r *http.Request) string {
-	if r.TLS != nil {
-		return "https"
-	}
-	// Honor X-Forwarded-Proto or Forwarded when present
-	if xf := r.Header.Get("X-Forwarded-Proto"); xf != "" {
-		return xf
-	}
-	if fwd := r.Header.Get("Forwarded"); fwd != "" {
-		// very simple parse proto= value
-		parts := strings.Split(fwd, ";")
-		for _, p := range parts {
-			p = strings.TrimSpace(p)
-			if strings.HasPrefix(strings.ToLower(p), "proto=") {
-				return strings.Trim(strings.SplitN(p, "=", 2)[1], "\"")
+		go func() {
+			log.Printf("httpdumper UI server starting on %s\n", uiAddr)
+			err := uiServer.ListenAndServe()
+			if err != nil && !errors.Is(err, http.ErrServerClosed) {
+				errCh <- fmt.Errorf("UI server error: %w", err)
+			} else {
+				errCh <- nil
 			}
+		}()
+	}
+
+	// Start main server in goroutine to enable signal handling
+	go func() {
+		err := mainServer.ListenAndServe()
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errCh <- fmt.Errorf("main server error: %w", err)
+		} else {
+			errCh <- nil
+		}
+	}()
+
+	// Signal handling for graceful shutdown
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+	select {
+	case sig := <-sigCh:
+		log.Printf("signal received: %v; initiating graceful shutdown (timeout=%s)", sig, shutdownTOFlag)
+	case err := <-errCh:
+		if err != nil {
+			log.Printf("server error before shutdown: %v", err)
 		}
 	}
-	return "http"
+
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownTOFlag)
+	defer cancel()
+
+	// Shutdown servers
+	if uiServer != nil {
+		if err := uiServer.Shutdown(ctx); err != nil {
+			log.Printf("UI server shutdown error: %v", err)
+		}
+	}
+	if err := mainServer.Shutdown(ctx); err != nil {
+		log.Printf("Main server shutdown error: %v", err)
+	}
+
+	log.Printf("shutdown complete")
 }

@@ -5,6 +5,7 @@ A tiny Go HTTP server that accepts any HTTP request, prints a detailed dump to s
 - Default listen port: 8080 (configurable via `-port`)
 - Optional echo mode: `-echo` mirrors request headers (excluding hop-by-hop) and echoes the request body
 - Request body capture is capped at 10 MiB for both dump and echo
+- Simple HTML UI shows the most recent requests kept in memory (configurable). Serve it on a separate port via `-ui-port` or on the same port when `-ui-port=0` (default). The UI also provides a per-request “Copy curl” button to reproduce the request.
 
 ## Features
 
@@ -60,6 +61,8 @@ curl -v http://localhost:8080/hello?x=1
 ```
 - Server logs a detailed request dump to stdout.
 - Response body is `OK\n` unless `-echo` is enabled.
+- UI: by default (no `-ui-port`), visit http://localhost:8080/ui and http://localhost:8080/requests.json.
+- With `-ui-port`, the UI is served on that port instead. Example: `-port 8080 -ui-port 9090` -> http://localhost:9090/ui
 
 ### Echo JSON body
 ```bash
@@ -80,8 +83,11 @@ X-Echo-Note: body truncated by server cap
 ```
 
 ## Flags
-- `-port int` (default `8080`): Port to listen on.
+- `-port int` (default `8080`): Port to listen on for request handling.
+- `-ui-port int`: Port to serve the UI (`/ui`, `/requests.json`). Set this flag to enable the UI.
 - `-echo` (default `false`): When set, mirrors request headers (excluding hop‑by‑hop) and echoes the request body.
+- `-history int` (default `1000`): Number of recent requests to keep in memory for the HTML UI and /requests.json.
+- `-shutdown-timeout duration` (default `10s`): Timeout for graceful shutdown when terminating (e.g., 5s, 1m).
 
 ## Notes and caveats
 - Hop‑by‑hop headers are intentionally not mirrored to comply with HTTP semantics.
@@ -96,12 +102,3 @@ X-Echo-Note: body truncated by server cap
 go build ./...
 go test ./...    # no tests yet, placeholder
 ```
-
-Basic project layout:
-- `main.go` – server implementation
-- `Dockerfile` – container build
-- `Makefile` – convenience targets
-- `go.mod` – module metadata
-
-## License
-MIT or your preferred license. Update this section as appropriate.

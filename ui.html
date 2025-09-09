@@ -1,0 +1,147 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>httpdumper UI</title>
+  <style>
+    body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;padding:16px;}
+    table{border-collapse:collapse;width:100%;table-layout:fixed;}
+    th,td{border:1px solid #ddd;padding:6px;vertical-align:top;}
+    th{background:#f5f5f5;position:sticky;top:0;}
+    .mono{font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, Monaco, monospace;white-space:pre-wrap;word-break:break-word;}
+    .nowrap{white-space:nowrap;}
+    .hdr-key{color:#6f42c1;font-weight:600;}
+    .hdr-val{color:#1f2328;}
+    .method{color:#0550ae;font-weight:700;}
+    .pill{background:#eee;border-radius:10px;padding:2px 6px;margin-left:6px;font-size:12px;color:#333;}
+    .controls{margin-bottom:10px;}
+    /* Fixed width columns */
+    .col-body{width:360px;}
+    .col-headers{width:420px;}
+    .col-time{width:170px;}
+    .cell-scroll{max-height:220px;overflow:auto;}
+    .copy-btn{border:1px solid #ccc;background:#f7f7f7;border-radius:4px;padding:2px 6px;cursor:pointer;font-size:12px}
+    .copy-btn:hover{background:#eee}
+  </style>
+</head>
+<body>
+  <h1>httpdumper UI</h1>
+  <div class="controls">Keeping last <span id="cap">?</span> requests. <a href="/requests.json" target="_blank" rel="noopener">JSON</a></div>
+  <table>
+    <thead>
+      <tr>
+        <th class="nowrap col-time">Time</th><th>Request</th><th class="col-body">Body<span class="pill">bytes</span></th><th class="col-headers">Headers</th>
+      </tr>
+    </thead>
+    <tbody id="tbody"></tbody>
+  </table>
+  <script>
+    function esc(s){
+      return (s==null?"":String(s)).replace(/[&<>"']/g, c=>({"&":"&amp;","<":"&lt;",
+        ">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
+    }
+    function fmtTime(iso){
+      try{
+        const d = new Date(iso);
+        if (isNaN(d)) return esc(iso||'');
+        const pad = n => String(n).padStart(2,'0');
+        return d.getFullYear()+"-"+pad(d.getMonth()+1)+"-"+pad(d.getDate())+" "+pad(d.getHours())+":"+pad(d.getMinutes())+":"+pad(d.getSeconds());
+      }catch(e){
+        return esc(iso||'');
+      }
+    }
+    function shEscape(s){
+      s = String(s);
+      if (s.length === 0) return "''";
+      // Wrap in single quotes, escape internal single quotes by closing, adding \\', reopening
+      return "'" + s.replace(/'/g, "'\\''") + "'";
+    }
+    function shouldSkipHeader(name){
+      const hop = new Set(['connection','keep-alive','proxy-connection','transfer-encoding','upgrade','te','trailer','content-length','host']);
+      return hop.has(String(name||'').toLowerCase());
+    }
+    function buildCurl(rec){
+      const scheme = (rec.proto && rec.proto.toUpperCase().startsWith('HTTP/')) ? 'http' : 'http';
+      const query = rec.query ? '?' + rec.query : '';
+      const url = scheme + '://' + rec.host + rec.path + query;
+      const parts = ['curl', '-i'];
+      if (rec.method && rec.method.toUpperCase() !== 'GET') {
+        parts.push('-X', shEscape(rec.method));
+      }
+      const headers = rec.headers || {};
+      Object.keys(headers).sort().forEach(k => {
+        if (shouldSkipHeader(k)) return;
+        headers[k].forEach(v => {
+          parts.push('-H', shEscape(k + ': ' + v));
+        });
+      });
+      if (rec.body && rec.body.length > 0) {
+        // Use --data-binary to preserve exact bytes; shell-escape body
+        parts.push('--data-binary', shEscape(rec.body));
+      }
+      parts.push(shEscape(url));
+      return parts.join(' ');
+    }
+    function safeDecode(s){
+      try{ return decodeURIComponent(String(s||'').replace(/\+/g,' ')); }catch(e){ return String(s||''); }
+    }
+    function renderQueryLines(q){
+      if(!q) return '';
+      const parts = String(q).split('&').filter(Boolean).map(p=>{
+        const [rawK, rawV] = p.split('=',2);
+        const k = safeDecode(rawK||'');
+        const v = safeDecode(rawV==null?'':rawV);
+        return `<div><span class="hdr-key">${esc(k)}</span>: <span class="hdr-val">${esc(v)}</span></div>`;
+      }).join('');
+      if (!parts) return '';
+      return `<div class="mono" style="margin-top:1px;color:#555;"><div style="font-weight:600;color:#333;margin-bottom:2px;">Query</div>${parts}</div>`;
+    }
+    async function load(){
+      const res = await fetch('/requests.json', {cache:'no-store'});
+      const list = await res.json();
+      // newest first is expected from server; if not, reverse:
+      // list.reverse();
+      const tbody = document.getElementById('tbody');
+      tbody.innerHTML = '';
+      list.forEach((rec, i)=>{
+        // attach a row-local copy handler after insertion
+        const bb = rec.truncated ? rec.bodyBytes + ' (truncated)' : rec.bodyBytes;
+        const headers = Object.keys(rec.headers||{}).sort().map(k=>
+          `<div><span class="hdr-key">${esc(k)}</span>: <span class="hdr-val">${esc((rec.headers[k]||[]).join(', '))}</span></div>`
+        ).join('');
+        const row = document.createElement('tr');
+        row.innerHTML = `
+          <td class="nowrap col-time">${fmtTime(rec.time)}</td>
+          <td class="mono">
+            <div><span class="method">${esc(rec.method)}</span> ${esc(rec.path)} <button title="Copy curl" type="button" data-idx="${i}" class="copy-btn" style="margin-left:8px;">📋</button></div>
+            ${renderQueryLines(rec.query)}
+          </td>
+          <td class="col-body"><div class="pill">${esc(bb)}</div><details><summary>show</summary><div class="mono cell-scroll">${esc(rec.body)}</div></details></td>
+          <td class="mono col-headers"><div class="cell-scroll">${headers}</div></td>`;
+        tbody.appendChild(row);
+        const btn = row.querySelector('.copy-btn');
+        if (btn) {
+          btn.addEventListener('click', async ()=>{
+            const cmd = buildCurl(rec);
+            try {
+              await navigator.clipboard.writeText(cmd);
+              const old = btn.textContent;
+              btn.textContent = 'Copied!';
+              setTimeout(()=>btn.textContent = old || '📋', 1200);
+            } catch (e) {
+              // Fallback
+              window.prompt('Copy curl command:', cmd);
+            }
+          });
+        }
+      });
+      // we can't know server cap from client; leave ? or fetch via a header in future
+      document.getElementById('cap').textContent = list.length.toString();
+    }
+    load();
+    // Optional auto-refresh every 3s
+    setInterval(load, 3000);
+  </script>
+</body>
+</html>
