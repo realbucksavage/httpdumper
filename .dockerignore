@@ -1,0 +1,8 @@
+# Exclude VCS and build artifacts
+.git
+.gitignore
+**/*.log
+bin/
+build/
+.out/
+.DS_Store
